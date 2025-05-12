@@ -7,23 +7,32 @@ from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQue
 import os
 import subprocess
 import requests
-#définition des variables de configurations de DBT
+
+# Définition des variables de configurations de DBT
 DBT_CLOUD_API_URL = 'https://cloud.getdbt.com/api/v2/accounts/70471823406401/jobs/70471823406468/run/'
 DBT_CLOUD_ACCOUNT_ID = '70471823406401'  
 DBT_CLOUD_JOB_ID = '70471823406468'  
 DBT_CLOUD_API_TOKEN = 'dbtc_qFg3PHUnbeXt-uH4bsDWNTWuy5T_d0zl97CdMsSvZwaEYKQV08'  
 
-# Variables de configuration de google BigQuery
+# Variables de configuration de Google BigQuery
 project_id = 'projet-carttrend'
 dataset_id = 'data_carttrend'
-#déclaration du chemin de la clé Jason avec les autorisations nécessaires dans l'environnement Airflow 
+
+# Déclaration du chemin de la clé JSON avec les autorisations nécessaires dans l'environnement Airflow 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/analyst/airflow/airflow-env/bin/cle_jason.json"
 
-#déclaration d'une liste qui contient toute les colonnes date pour les formater pendant le traitement des données
-date_columns = ['date','date_inscription','date_commande','date_livraison_estimée','date_début','date_fin','date_post']
+# Liste qui contient toutes les colonnes date pour les formater pendant le traitement des données
+date_columns = [
+    'date',
+    'date_inscription',
+    'date_commande',
+    'date_livraison_estimée',
+    'date_début',
+    'date_fin',
+    'date_post'
+]
 
-# déclaration des adresses url dans fichiers csv dans un dictionnaire
-
+# Déclaration des adresses URL des fichiers CSV dans un dictionnaire
 file_urls = {
     "Carttrend_Campaigns": "https://docs.google.com/spreadsheets/d/1_WxFdSWGGCNreMgSWf9nfuP-Ye_RnCX1Xs5ubnjGp9s/edit",
     "Carttrend_Clients": "https://docs.google.com/spreadsheets/d/1PkZuSLHn0eZQLjhBx8qdZ_bh_wzgMbenrYyMGYrxBic/edit",
@@ -37,7 +46,7 @@ file_urls = {
     "Carttrend_Satisfaction": "https://docs.google.com/spreadsheets/d/1G7rST778z_zcewJX9CuURwIqTSKfWCU_i6ZJ9P8edzM/edit"
 }
 
-# Fonction pour l'extraction des données à partir d'un lien de Google Sheet
+# Extraction des données depuis Google Sheets
 def extract_all_sheets(file_urls):
     all_dataframes = []
     for key, value in file_urls.items():
@@ -50,30 +59,25 @@ def extract_all_sheets(file_urls):
             print(f"Erreur lors du téléchargement de {key}: {e}")
     return all_dataframes
 
-# Fonction de pré-transformation des données
+# Pré-transformation des données
 def pre_transform(dataframes):
     dataframes_cleaned = []
     for df in dataframes:
-        # Nettoyage des colonnes contenant des dates
         if 'date_columns' in locals() or 'date_columns' in globals():
             for col in date_columns:
                 if col in df.columns:
                     try:
-                        df[col] = pd.to_datetime(df[col], errors='coerce')  # Convertir en datetime avec gestion des erreurs
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
                     except Exception as e:
                         print(f"Erreur lors de la conversion de la colonne {col} en date: {e}")
 
-        # Nettoyage des noms de colonnes : retirer les espaces, caractères spéciaux
         df.columns = df.columns.str.strip().str.replace(' ', '_').str.replace(r'[^\w]', '', regex=True)
-
-        # Suppression des doublons
         df = df.drop_duplicates()
-
         dataframes_cleaned.append(df)
 
     return dataframes_cleaned
 
-# Fonction pour charger les données dans BigQuery
+# Chargement dans BigQuery
 def load_to_bigquery(dataframes_cleaned, project_id, dataset_id, file_urls):
     client = bigquery.Client(project_id)
     table_keys = list(file_urls.keys())
@@ -83,7 +87,7 @@ def load_to_bigquery(dataframes_cleaned, project_id, dataset_id, file_urls):
         table_id = f"{project_id}.{dataset_id}.{table_name}"
 
         job_config = bigquery.LoadJobConfig(
-            write_disposition="WRITE_TRUNCATE",  # Remplacer par WRITE_APPEND si nécessaire
+            write_disposition="WRITE_TRUNCATE",
             autodetect=True
         )
 
@@ -93,29 +97,27 @@ def load_to_bigquery(dataframes_cleaned, project_id, dataset_id, file_urls):
                 table_id,
                 job_config=job_config
             )
-            load_job.result()  # Attend que le job se termine
+            load_job.result()
             print(f"La table {table_id} a été chargée avec succès.")
         except Exception as e:
             print(f"Erreur lors du chargement de la table {table_id}: {e}")
             print("Aperçu des données problématiques :")
             print(df.head(10))
             raise
-        
-# Fonction pour lancer le DBT RUN
+
+# Lancer le DBT RUN
 def run_dbt_transform():
     headers = {
         'Authorization': f'Bearer {DBT_CLOUD_API_TOKEN}',
         'Content-Type': 'application/json'
     }
 
-    # Récupérer la liste des jobs disponibles
     jobs_url = f'https://cloud.getdbt.com/api/v2/accounts/{DBT_CLOUD_ACCOUNT_ID}/jobs/'
     response = requests.get(jobs_url, headers=headers)
 
     if response.status_code == 200:
         jobs = response.json().get('data', [])
         if jobs:
-            # Récupérer le premier job trouvé
             job_id = jobs[0]['id']
             print(f"Job trouvé, ID: {job_id}")
         else:
@@ -125,47 +127,28 @@ def run_dbt_transform():
         print(f"Erreur lors de la récupération des jobs : {response.text}")
         return None
 
-    # Lancer le job DBT
-    data = {"cause": "Exécution automatique via Airflow"}
-    run_url = DBT_CLOUD_API_URL.format(account_id=DBT_CLOUD_ACCOUNT_ID, job_id=job_id)
-
-    response = requests.post(run_url, headers=headers, json=data)
-
-    if response.status_code == 200:
-        run_id = response.json()['data']['id']
-        print(f"Job DBT Cloud lancé avec succès. Run ID: {run_id}")
-        return run_id  # Retourner l'ID du job pour suivi
-    else:
-        print(f"Erreur lors du lancement du job DBT Cloud : {response.text}")
-        return None
-
-    
-
-# Définir le DAG
+# Définition du DAG
 with DAG(
     'carttrend_etl_testf',
     description='ETL pour charger les données de Google Sheets vers BigQuery',
-    schedule_interval='@daily',  # S'exécute une fois par jour
-    start_date=datetime(2024, 12, 10),  # Date de démarrage du DAG
+    schedule_interval='@daily',
+    start_date=datetime(2024, 12, 10),
     catchup=False,
     tags=['carttrend', 'ETL', 'bigquery']
 ) as dag:
 
-    # Tâche pour extraire les données des fichiers Google Sheets
     extract_task = PythonOperator(
         task_id='extract_data',
         python_callable=extract_all_sheets,
         op_args=[file_urls]
     )
 
-    # Tâche de pré-transformation
     pre_transform_task = PythonOperator(
         task_id='pre_transform_data',
         python_callable=lambda ti: pre_transform(ti.xcom_pull(task_ids="extract_data")),
         provide_context=True
     )
 
-    # Tâche pour charger les données dans BigQuery
     load_task = PythonOperator(
         task_id='load_data_to_bigquery',
         python_callable=lambda ti: load_to_bigquery(
@@ -175,9 +158,8 @@ with DAG(
     )
 
     dbt_transform_task = PythonOperator(
-    task_id='run_dbt_transformations',
-    python_callable=run_dbt_transform
-)
+        task_id='run_dbt_transformations',
+        python_callable=run_dbt_transform
+    )
 
-    # Définir l'ordre des tâches
     extract_task >> pre_transform_task >> load_task >> dbt_transform_task
