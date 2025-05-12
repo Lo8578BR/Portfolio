@@ -1,0 +1,165 @@
+import pandas as pd
+from google.cloud import bigquery
+from datetime import datetime
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+import os
+import subprocess
+import requests
+
+# Définition des variables de configurations de DBT
+DBT_CLOUD_API_URL = 'https://cloud.getdbt.com/api/v2/accounts/70471823406401/jobs/70471823406468/run/'
+DBT_CLOUD_ACCOUNT_ID = '70471823406401'  
+DBT_CLOUD_JOB_ID = '70471823406468'  
+DBT_CLOUD_API_TOKEN = 'dbtc_qFg3PHUnbeXt-uH4bsDWNTWuy5T_d0zl97CdMsSvZwaEYKQV08'  
+
+# Variables de configuration de Google BigQuery
+project_id = 'projet-carttrend'
+dataset_id = 'data_carttrend'
+
+# Déclaration du chemin de la clé JSON avec les autorisations nécessaires dans l'environnement Airflow 
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/analyst/airflow/airflow-env/bin/cle_jason.json"
+
+# Liste qui contient toutes les colonnes date pour les formater pendant le traitement des données
+date_columns = [
+    'date',
+    'date_inscription',
+    'date_commande',
+    'date_livraison_estimée',
+    'date_début',
+    'date_fin',
+    'date_post'
+]
+
+# Déclaration des adresses URL des fichiers CSV dans un dictionnaire
+file_urls = {
+    "Carttrend_Campaigns": "https://docs.google.com/spreadsheets/d/1_WxFdSWGGCNreMgSWf9nfuP-Ye_RnCX1Xs5ubnjGp9s/edit",
+    "Carttrend_Clients": "https://docs.google.com/spreadsheets/d/1PkZuSLHn0eZQLjhBx8qdZ_bh_wzgMbenrYyMGYrxBic/edit",
+    "Carttrend_Commandes": "https://docs.google.com/spreadsheets/d/1QVXmhf9b2OSpUVb7uBOQOClk19ldleNYQcloKCrHlgA/edit",
+    "Carttrend_Details_Commandes": "https://docs.google.com/spreadsheets/d/1kN4O2D-LIvbLSTse2RsguJMPwdMWKtVY6dEl_4hcyqw/edit",
+    "Carttrend_Entrepots_Machines": "https://docs.google.com/spreadsheets/d/1s9R6eJPlC0Vwz_OPRTZ43XXfknBAXktn/edit",
+    "Carttrend_Entrepots": "https://docs.google.com/spreadsheets/d/1FSP2Gv31H1lnpLh6nmaNFcKlCE11OlbA/edit",
+    "Carttrend_Posts": "https://docs.google.com/spreadsheets/d/1N81drG9zhp9VBZh3LqPoQ01cMvXol1kX43hqhQtAZ44/edit",
+    "Carttrend_Produits": "https://docs.google.com/spreadsheets/d/1I4KHaFSEMMJ2E7OEO-v1KWbYfOGUBGiC8XCUVvFHs2I/edit",
+    "Carttrend_Promotions": "https://docs.google.com/spreadsheets/d/1p2O-Zgmhcmfov1BkLb7Rx9k2iwg65kFcgVyYwb4CYs4/edit",
+    "Carttrend_Satisfaction": "https://docs.google.com/spreadsheets/d/1G7rST778z_zcewJX9CuURwIqTSKfWCU_i6ZJ9P8edzM/edit"
+}
+
+# Extraction des données depuis Google Sheets
+def extract_all_sheets(file_urls):
+    all_dataframes = []
+    for key, value in file_urls.items():
+        csv_url = value.replace("/edit", "/export?format=csv")
+        try:
+            df = pd.read_csv(csv_url)
+            if df is not None:
+                all_dataframes.append(df)
+        except Exception as e:
+            print(f"Erreur lors du téléchargement de {key}: {e}")
+    return all_dataframes
+
+# Pré-transformation des données
+def pre_transform(dataframes):
+    dataframes_cleaned = []
+    for df in dataframes:
+        if 'date_columns' in locals() or 'date_columns' in globals():
+            for col in date_columns:
+                if col in df.columns:
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                    except Exception as e:
+                        print(f"Erreur lors de la conversion de la colonne {col} en date: {e}")
+
+        df.columns = df.columns.str.strip().str.replace(' ', '_').str.replace(r'[^\w]', '', regex=True)
+        df = df.drop_duplicates()
+        dataframes_cleaned.append(df)
+
+    return dataframes_cleaned
+
+# Chargement dans BigQuery
+def load_to_bigquery(dataframes_cleaned, project_id, dataset_id, file_urls):
+    client = bigquery.Client(project_id)
+    table_keys = list(file_urls.keys())
+
+    for i, df in enumerate(dataframes_cleaned):
+        table_name = table_keys[i]
+        table_id = f"{project_id}.{dataset_id}.{table_name}"
+
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            autodetect=True
+        )
+
+        try:
+            load_job = client.load_table_from_dataframe(
+                df,
+                table_id,
+                job_config=job_config
+            )
+            load_job.result()
+            print(f"La table {table_id} a été chargée avec succès.")
+        except Exception as e:
+            print(f"Erreur lors du chargement de la table {table_id}: {e}")
+            print("Aperçu des données problématiques :")
+            print(df.head(10))
+            raise
+
+# Lancer le DBT RUN
+def run_dbt_transform():
+    headers = {
+        'Authorization': f'Bearer {DBT_CLOUD_API_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+
+    jobs_url = f'https://cloud.getdbt.com/api/v2/accounts/{DBT_CLOUD_ACCOUNT_ID}/jobs/'
+    response = requests.get(jobs_url, headers=headers)
+
+    if response.status_code == 200:
+        jobs = response.json().get('data', [])
+        if jobs:
+            job_id = jobs[0]['id']
+            print(f"Job trouvé, ID: {job_id}")
+        else:
+            print("Aucun job trouvé.")
+            return None
+    else:
+        print(f"Erreur lors de la récupération des jobs : {response.text}")
+        return None
+
+# Définition du DAG
+with DAG(
+    'carttrend_etl_testf',
+    description='ETL pour charger les données de Google Sheets vers BigQuery',
+    schedule_interval='@daily',
+    start_date=datetime(2024, 12, 10),
+    catchup=False,
+    tags=['carttrend', 'ETL', 'bigquery']
+) as dag:
+
+    extract_task = PythonOperator(
+        task_id='extract_data',
+        python_callable=extract_all_sheets,
+        op_args=[file_urls]
+    )
+
+    pre_transform_task = PythonOperator(
+        task_id='pre_transform_data',
+        python_callable=lambda ti: pre_transform(ti.xcom_pull(task_ids="extract_data")),
+        provide_context=True
+    )
+
+    load_task = PythonOperator(
+        task_id='load_data_to_bigquery',
+        python_callable=lambda ti: load_to_bigquery(
+            ti.xcom_pull(task_ids="pre_transform_data"), project_id, dataset_id, file_urls
+        ),
+        provide_context=True
+    )
+
+    dbt_transform_task = PythonOperator(
+        task_id='run_dbt_transformations',
+        python_callable=run_dbt_transform
+    )
+
+    extract_task >> pre_transform_task >> load_task >> dbt_transform_task
